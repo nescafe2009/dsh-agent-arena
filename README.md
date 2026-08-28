@@ -8,7 +8,7 @@
 
 <p align="center"><sub>直接选择已经配置好的 AI 用户，创建长期协作会议，而不是重复填写 provider 和 model。</sub></p>
 
-## v4.0 权限与协作界面更新
+## v0.4.0 权限与协作界面更新
 
 - **每个对话独立设置 Agent 权限**：会议和群聊中的每个 AI 角色（包括管理员）都可以分别选择 `Read Only`、`Workspace Write` 或 `Full access`，不会修改该角色在其他对话中的权限。
 - **原生审批式交互**：受限角色需要执行高风险动作时，审批请求直接显示在聊天记录中；人类可以允许一次、拒绝，或附加自己的执行要求。
@@ -196,7 +196,7 @@ npm run build
 本仓库提交了预构建的 `lib/`，安装时不需要本机 TypeScript 工具链。推荐固定到正式版本：
 
 ```powershell
-<DSH 安装目录>\manage-dsh.bat plugin --profile web add "github:Tikzen/dsh-agent-arena#v4.0"
+<DSH 安装目录>\manage-dsh.bat plugin --profile web add "github:Tikzen/dsh-agent-arena#v0.4.0"
 ```
 
 如果希望直接跟随 `main` 分支的最新开发版本：
