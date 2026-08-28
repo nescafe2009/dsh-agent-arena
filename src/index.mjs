@@ -39,6 +39,12 @@ const COOLDOWN_MS = 60_000
 const CHANNEL_WINDOW_MS = 60_000
 const DEFAULT_CHANNEL_REQUEST_LIMIT = 55
 const DEFAULT_COOLDOWN_ERROR_STATUSES = Object.freeze([429, 500])
+const AGENT_PERMISSION_MODES = Object.freeze(['read-only', 'workspace-write', 'danger-full-access'])
+const AGENT_PERMISSION_LABELS = Object.freeze({
+  'read-only': 'Read Only',
+  'workspace-write': 'Workspace Write',
+  'danger-full-access': 'Full access',
+})
 const RATE_LIMIT_RE = /(?:429|rate.?limit|too many requests|频率|限流|请求过于频繁)/i
 const RETRY_CHANNEL_EXHAUSTED_RE = /(?:get_channel_failed|可用渠道不存在[（(]retry[）)]|upstream rate limit exceeded)/i
 const EMPTY_RESPONSE_RE = /(?:EMPTY_RESPONSE|returned a completed response with no content)/i
@@ -325,6 +331,8 @@ export function apply(ctx, config = {}) {
   const channelCooldowns = new Map()
   const channelRequestTimes = new Map()
   const arenaSessionIds = new Set()
+  const arenaSessionContexts = new Map()
+  const pendingApprovals = new Map()
   let activeCount = 0
   let disposed = false
   let persistChain = Promise.resolve()
@@ -353,7 +361,12 @@ export function apply(ctx, config = {}) {
         detail: current?.detail || '',
         currentTool: current?.currentTool || '',
         claimedFiles: Array.isArray(current?.claimedFiles) ? current.claimedFiles.slice(0, 20) : [],
-        recent: Array.isArray(current?.recent) ? current.recent.slice(-10) : [],
+        history: Array.isArray(current?.history)
+          ? current.history.slice(-2000)
+          : Array.isArray(current?.recent) ? current.recent.slice(-10) : [],
+        recent: Array.isArray(current?.history)
+          ? current.history.slice(-10)
+          : Array.isArray(current?.recent) ? current.recent.slice(-10) : [],
         updatedAt: current?.updatedAt || nowIso(),
       }
     })
@@ -554,7 +567,7 @@ export function apply(ctx, config = {}) {
     if (!role) {
       role = {
         profileId: profile.id, name: profile.name, avatar: profile.avatar, model: profile.model || '',
-        status: 'idle', stage: '等待任务', detail: '', currentTool: '', claimedFiles: [], recent: [], updatedAt: nowIso(),
+        status: 'idle', stage: '等待任务', detail: '', currentTool: '', claimedFiles: [], history: [], recent: [], updatedAt: nowIso(),
       }
       monitor.roles.push(role)
     }
@@ -573,10 +586,12 @@ export function apply(ctx, config = {}) {
     })
     if (eventText) {
       const text = String(eventText).trim().slice(0, 320)
-      const last = role.recent.at(-1)
+      const last = role.history.at(-1) || role.recent.at(-1)
       if (!last || last.text !== text || last.kind !== eventKind) {
-        role.recent.push({ id: randomUUID(), kind: eventKind, text, createdAt: timestamp })
-        role.recent = role.recent.slice(-10)
+        role.history ??= []
+        role.history.push({ id: randomUUID(), kind: eventKind, text, createdAt: timestamp })
+        role.history = role.history.slice(-2000)
+        role.recent = role.history.slice(-10)
       }
     }
     container.activityMonitor.updatedAt = timestamp
@@ -937,6 +952,9 @@ export function apply(ctx, config = {}) {
           room.messages.push({ id: randomUUID(), kind: 'system', senderId: 'system', senderName: '系统', avatar: 'ℹ️', text: 'DSH 重启中断了上次回复，请重新发送消息。', createdAt: nowIso() })
         }
         room.mutedParticipantIds = Array.isArray(room.mutedParticipantIds) ? room.mutedParticipantIds : []
+        room.permissions = room.permissions && typeof room.permissions === 'object' ? room.permissions : {}
+        for (const participant of permissionProfiles(room)) room.permissions[participant.id] = normalizePermissionMode(room.permissions[participant.id])
+        for (const message of room.messages ?? []) if (message.approval?.status === 'pending') message.approval.status = 'cancelled'
         room.respondingProfileIds = Array.isArray(room.respondingProfileIds) ? room.respondingProfileIds : []
         const roomMonitor = ensureActivityMonitor(room)
         for (const role of roomMonitor.roles) {
@@ -960,6 +978,9 @@ export function apply(ctx, config = {}) {
           meeting.participants = (meeting.participants ?? []).map(item => ({ ...item, status: 'idle' }))
         }
         meeting.mutedParticipantIds = Array.isArray(meeting.mutedParticipantIds) ? meeting.mutedParticipantIds : []
+        meeting.permissions = meeting.permissions && typeof meeting.permissions === 'object' ? meeting.permissions : {}
+        for (const participant of permissionProfiles(meeting)) meeting.permissions[participant.id] = normalizePermissionMode(meeting.permissions[participant.id])
+        for (const message of meeting.transcript ?? []) if (message.approval?.status === 'pending') message.approval.status = 'cancelled'
         const meetingMonitor = ensureActivityMonitor(meeting)
         for (const role of meetingMonitor.roles) {
           role.status = meeting.mutedParticipantIds.includes(role.profileId) ? 'muted' : 'idle'
@@ -1124,6 +1145,96 @@ export function apply(ctx, config = {}) {
     return modelSelection(latest)
   }
 
+  function normalizePermissionMode(value) {
+    const mode = String(value || '')
+    return AGENT_PERMISSION_MODES.includes(mode) ? mode : 'danger-full-access'
+  }
+
+  function permissionFor(container, profileId) {
+    return normalizePermissionMode(container?.permissions?.[profileId])
+  }
+
+  function permissionProfiles(container) {
+    const items = [...(container?.participants ?? [])]
+    const administrator = container?.administratorProfile
+    if (administrator?.id && !items.some(item => item.id === administrator.id)) items.unshift(administrator)
+    return items
+  }
+
+  function permissionSpec(mode) {
+    const normalized = normalizePermissionMode(mode)
+    return {
+      mode: normalized,
+      label: AGENT_PERMISSION_LABELS[normalized],
+      sandbox: normalized,
+      approval: normalized === 'danger-full-access' ? 'never' : 'ask',
+    }
+  }
+
+  function applyAgentPermission(handle, mode) {
+    if (!handle?.agent?.session) return
+    const spec = permissionSpec(mode)
+    const session = handle.agent.session
+    try { session.append('sandbox/mode', { mode: spec.sandbox }) } catch { /* older DSH builds may not expose this event */ }
+    try { session.append('approval/policy', { policy: spec.approval }) } catch { /* best effort */ }
+    try { ctx.get('approval')?.setPolicy(handle.agent, spec.approval) } catch { /* best effort */ }
+  }
+
+  function containerForApproval(agent) {
+    return arenaSessionContexts.get(String(agent?.id || ''))
+  }
+
+  function approvalIdForRequest(req) {
+    const events = req?.agent?.session?.events || []
+    const decided = new Set()
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index]
+      if (event.type === 'approval/decided') { decided.add(event.data.id); continue }
+      if (event.type !== 'approval/asked' || decided.has(event.data.id)) continue
+      if ((req.callId ?? null) !== (event.data.callId ?? null)) continue
+      if ([...pendingApprovals.values()].some(item => item.approvalId === event.data.id)) continue
+      return String(event.data.id)
+    }
+    return ''
+  }
+
+  function approvalMessage(container, approvalId, req, profile) {
+    const text = `需要你审计 ${profile?.name || 'AI'} 的操作：${req.toolName}${req.reason ? `\n${req.reason}` : ''}`
+    const base = {
+      id: randomUUID(), kind: container.type === 'meeting' ? 'system' : 'system',
+      senderId: 'system', senderName: '权限审计', avatar: '🛡️', text, createdAt: nowIso(),
+      approval: { id: approvalId, toolName: req.toolName, reason: req.reason || '', status: 'pending', options: ['allow-once', 'reject', 'manual'] },
+    }
+    if (Array.isArray(container.transcript)) container.transcript.push(base)
+    else if (Array.isArray(container.messages)) container.messages.push(base)
+    return base
+  }
+
+  function approvalContainerMessage(entry) {
+    return Array.isArray(entry.container?.transcript)
+      ? entry.container.transcript.find(item => item.approval?.id === entry.approvalId)
+      : entry.container?.messages?.find(item => item.approval?.id === entry.approvalId)
+  }
+
+  async function resolveArenaApproval(container, raw) {
+    const approvalId = String(raw?.approvalId || '')
+    const entry = pendingApprovals.get(approvalId)
+    if (!entry || entry.container !== container) throw new HttpError(404, '没有找到待审计的操作')
+    const choice = String(raw?.outcome || '')
+    if (!['allowed-once', 'rejected'].includes(choice)) throw new HttpError(400, '审批结果无效')
+    const note = typeof raw?.note === 'string' ? raw.note.trim().slice(0, 2000) : ''
+    const message = approvalContainerMessage(entry)
+    if (message?.approval) Object.assign(message.approval, { status: choice === 'allowed-once' ? 'approved' : 'rejected', note })
+    if (note) {
+      const target = Array.isArray(container.transcript) ? container.transcript : container.messages
+      target.push({ id: randomUUID(), kind: 'human', senderId: 'human', senderName: profiles.human.name, avatar: profiles.human.avatar, text: `审计备注：${note}`, createdAt: nowIso() })
+    }
+    pendingApprovals.delete(approvalId)
+    entry.resolve(choice)
+    await persist()
+    return container
+  }
+
   async function createParent(label, signal) {
     const composition = await resolveAgentPreset()
     const selection = modelSelection()
@@ -1256,9 +1367,34 @@ export function apply(ctx, config = {}) {
       if (!arenaSessionIds.has(String(options.sessionId || ''))) return next()
       return guardedArenaStream(options, next)
     })
+    const disposeApproval = ctx.on('approval/request', (req, next) => {
+      const context = containerForApproval(req?.agent)
+      if (!context) return next()
+      const approvalId = approvalIdForRequest(req)
+      if (!approvalId) return next()
+      const { container, profile } = context
+      const message = approvalMessage(container, approvalId, req, profile)
+      container.updatedAt = nowIso()
+      void persist()
+      return new Promise(resolve => {
+        pendingApprovals.set(approvalId, { approvalId, container, runtime: context.runtime, profile, resolve, message })
+        req.signal?.addEventListener('abort', () => {
+          const pending = pendingApprovals.get(approvalId)
+          if (!pending) return
+          pendingApprovals.delete(approvalId)
+          if (message.approval) message.approval.status = 'cancelled'
+          resolve('cancelled')
+          void persist()
+        }, { once: true })
+      })
+    }, true)
     return () => {
       disposeRequest()
       disposeStream()
+      disposeApproval()
+      for (const pending of pendingApprovals.values()) pending.resolve('cancelled')
+      pendingApprovals.clear()
+      arenaSessionContexts.clear()
       channelQueues.clear()
       channelCooldowns.clear()
       channelRequestTimes.clear()
@@ -1329,8 +1465,10 @@ export function apply(ctx, config = {}) {
         installCoordinationPlane(agentCtx, runtime, profile)
       },
     })
+    applyAgentPermission(handle, permissionFor(runtime.container, profile.id))
     await archiveArenaAgent(handle)
     runtime.agentHandles.add(handle)
+    arenaSessionContexts.set(String(handle.agent.id), { container: runtime.container, runtime, profile })
     runtime.abort.signal.addEventListener('abort', () => handle.agent.cancel({ kind: 'user' }), { once: true })
     return handle
   }
@@ -1948,6 +2086,7 @@ export function apply(ctx, config = {}) {
       administratorProfile: administratorSnapshot(), humanProfile: { ...profiles.human }, status: 'queued', turnCount: 0,
       createdAt, updatedAt: createdAt, transcript: [], mutedParticipantIds: [], userVote: null, verdict: null, error: null,
       collaborationStage: 'discussion', tasks: [], decisions: [], artifacts: [],
+      permissions: Object.fromEntries([['administrator', 'danger-full-access'], ...input.participants.map(item => [item.id, 'danger-full-access'])]),
     }
     ensureActivityMonitor(meeting)
     meetings.set(meeting.id, meeting)
@@ -1966,9 +2105,29 @@ export function apply(ctx, config = {}) {
     const invited = newIds.map(id => profiles.aiUsers.find(item => item.id === id))
     if (invited.some(item => !item)) throw new HttpError(400, '邀请列表中包含已不存在的 AI 用户')
     meeting.participants.push(...invited.map(item => ({ ...item, status: 'idle' })))
+    meeting.permissions ??= {}
+    for (const item of invited) meeting.permissions[item.id] = 'danger-full-access'
     ensureActivityMonitor(meeting)
     appendSystem(meeting, `${invited.map(item => item.name).join('、')} 加入了会议。`, true)
     return meeting
+  }
+
+  async function setContainerPermission(container, raw) {
+    const profileId = String(raw?.profileId || '')
+    const target = permissionProfiles(container).find(item => item.id === profileId)
+    if (!target) throw new HttpError(400, '权限目标不是当前对话成员')
+    const mode = normalizePermissionMode(raw?.mode)
+    container.permissions ??= {}
+    container.permissions[profileId] = mode
+    const runtime = runtimes.get(container.id) || roomRuntimes.get(container.id)
+    const pending = runtime?.roleAgents?.get(profileId)
+    if (pending) {
+      try { applyAgentPermission(await pending, mode) } catch { /* agent may be disposed between turns */ }
+    }
+    appendSystem(container, `${target.name || 'AI'} 的权限已设置为 ${AGENT_PERMISSION_LABELS[mode]}。`, Boolean(container.topic))
+    container.updatedAt = nowIso()
+    await persist()
+    return container
   }
 
   async function actOnMeeting(meeting, body) {
@@ -2054,10 +2213,14 @@ export function apply(ctx, config = {}) {
       }
     } else if (action === 'invite-members') {
       addMeetingMembers(meeting, body)
+    } else if (action === 'set-permission') {
+      await setContainerPermission(meeting, body)
     } else if (action === 'set-stage') {
       const stage = String(body.stage ?? '')
       if (!MEETING_STAGES.includes(stage) || stage === 'completed') throw new HttpError(400, '协作阶段无效')
       meeting.collaborationStage = stage
+    } else if (action === 'approval') {
+      await resolveArenaApproval(meeting, body)
     } else if (action === 'task-create') {
       createWorkspaceTask(meeting, body, 'human')
     } else if (action === 'task-update') {
@@ -2288,7 +2451,7 @@ export function apply(ctx, config = {}) {
       name: nameInput || (type === 'direct' ? participants[0].name : `${participants.map(item => item.name).join('、')}的小群`),
       participants: participants.map(item => ({ ...item })), humanProfile: { ...profiles.human },
       administratorProfile: type === 'group' ? administratorSnapshot() : null,
-      messages: [], mutedParticipantIds: [], status: 'idle', respondingProfileId: null, respondingProfileIds: [], createdAt, updatedAt: createdAt,
+      messages: [], mutedParticipantIds: [], permissions: Object.fromEntries([...(type === 'group' ? [['administrator', 'danger-full-access']] : []), ...participants.map(item => [item.id, 'danger-full-access'])]), status: 'idle', respondingProfileId: null, respondingProfileIds: [], createdAt, updatedAt: createdAt,
     }
     ensureActivityMonitor(room)
     rooms.set(room.id, room)
@@ -2341,6 +2504,8 @@ export function apply(ctx, config = {}) {
     const invited = newIds.map(id => profiles.aiUsers.find(item => item.id === id))
     if (invited.some(item => !item)) throw new HttpError(400, '邀请列表中包含已不存在的 AI 用户')
     room.participants.push(...invited.map(item => ({ ...item })))
+    room.permissions ??= {}
+    for (const item of invited) room.permissions[item.id] = 'danger-full-access'
     ensureActivityMonitor(room)
     appendSystem(room, `${invited.map(item => item.name).join('、')} 加入了群聊。`, false)
     room.updatedAt = nowIso()
@@ -2414,7 +2579,7 @@ export function apply(ctx, config = {}) {
         if (method === 'POST' && suffix === '/rooms') {
           respond(res, 201, { room: publicMeeting(await createRoom(await readJsonBody(req))) }); return
         }
-        const roomMatch = /^\/rooms\/([^/]+)(?:\/(messages|members|retry))?$/.exec(suffix)
+        const roomMatch = /^\/rooms\/([^/]+)(?:\/(messages|members|retry|actions))?$/.exec(suffix)
         if (roomMatch) {
           const room = roomOrThrow(decodeURIComponent(roomMatch[1]))
           if (method === 'GET' && !roomMatch[2]) { respond(res, 200, { room: publicMeeting(room) }); return }
@@ -2422,6 +2587,13 @@ export function apply(ctx, config = {}) {
           if (method === 'POST' && suffix.endsWith('/messages')) { respond(res, 202, { room: publicMeeting(await sendRoomMessage(room, await readJsonBody(req))) }); return }
           if (method === 'POST' && suffix.endsWith('/members')) { respond(res, 200, { room: publicMeeting(await addRoomMembers(room, await readJsonBody(req))) }); return }
           if (method === 'POST' && suffix.endsWith('/retry')) { respond(res, 202, { room: publicMeeting(await retryRoomMessage(room)) }); return }
+          if (method === 'POST' && suffix.endsWith('/actions')) {
+            const body = await readJsonBody(req)
+            if (String(body?.action || '') === 'set-permission') await setContainerPermission(room, body)
+            else if (String(body?.action || '') === 'approval') await resolveArenaApproval(room, body)
+            else throw new HttpError(400, '未知聊天操作')
+            respond(res, 200, { room: publicMeeting(room) }); return
+          }
           if (method === 'DELETE' && !roomMatch[2]) {
             const runtime = roomRuntimes.get(room.id)
             if (runtime) runtime.abort.abort(new Error('Deleted by user'))

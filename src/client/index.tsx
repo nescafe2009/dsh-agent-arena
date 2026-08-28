@@ -43,6 +43,7 @@ interface TranscriptItem {
   phase?: 'ack' | 'live' | 'result' | 'summary'
   streamId?: string
   sequence?: number
+  approval?: ApprovalRequest
 }
 
 interface Verdict {
@@ -133,6 +134,7 @@ interface Meeting {
   tasks?: MeetingTask[]
   decisions?: MeetingDecision[]
   artifacts?: MeetingArtifact[]
+  permissions?: Record<string, string>
 }
 
 interface ArenaSettings {
@@ -163,6 +165,15 @@ interface UserProfile {
   autoReplyDisabled?: boolean
 }
 
+interface ApprovalRequest {
+  id: string
+  toolName: string
+  reason?: string
+  status: 'pending' | 'approved' | 'rejected' | 'cancelled'
+  note?: string
+  options?: string[]
+}
+
 interface ChatMessage {
   id: string
   kind: 'human' | 'ai' | 'admin' | 'system'
@@ -175,6 +186,7 @@ interface ChatMessage {
   phase?: 'ack' | 'live' | 'result' | 'summary'
   streamId?: string
   sequence?: number
+  approval?: ApprovalRequest
 }
 
 interface ChatRoom {
@@ -192,6 +204,7 @@ interface ChatRoom {
   createdAt: string
   updatedAt: string
   activityMonitor?: ActivityMonitor
+  permissions?: Record<string, string>
 }
 
 interface RoleActivityEvent {
@@ -212,6 +225,7 @@ interface RoleActivity {
   currentTool: string
   claimedFiles: string[]
   recent: RoleActivityEvent[]
+  history?: RoleActivityEvent[]
   updatedAt: string
 }
 
@@ -1129,9 +1143,14 @@ function activityTime(value: string): string {
   return Number.isNaN(date.getTime()) ? '' : date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
-function RoleMonitor(props: { monitor?: ActivityMonitor }): ReactNode {
+function RoleMonitor(props: { monitor?: ActivityMonitor; permissions?: Record<string, string>; onPermission?: (profileId: string, mode: string) => Promise<void> }): ReactNode {
+  const { permissions, onPermission } = props
   const roles = props.monitor?.roles ?? []
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
+  const [historyRole, setHistoryRole] = useState<RoleActivity | null>(null)
+  const [permissionDrafts, setPermissionDrafts] = useState<Record<string, string>>({})
+  const [permissionBusy, setPermissionBusy] = useState<Record<string, boolean>>({})
+  const [permissionErrors, setPermissionErrors] = useState<Record<string, string>>({})
 
   useEffect(() => {
     setExpanded(current => {
@@ -1151,6 +1170,34 @@ function RoleMonitor(props: { monitor?: ActivityMonitor }): ReactNode {
     })
   }, [roles.map(role => `${role.profileId}:${role.status}`).join('|')])
 
+  useEffect(() => {
+    setPermissionDrafts(current => {
+      const next = { ...current }
+      let changed = false
+      for (const [profileId, mode] of Object.entries(current)) {
+        if (permissions?.[profileId] !== mode) continue
+        delete next[profileId]
+        changed = true
+      }
+      return changed ? next : current
+    })
+  }, [permissions])
+
+  const changePermission = async (profileId: string, mode: string): Promise<void> => {
+    if (!onPermission) return
+    setPermissionDrafts(current => ({ ...current, [profileId]: mode }))
+    setPermissionBusy(current => ({ ...current, [profileId]: true }))
+    setPermissionErrors(current => ({ ...current, [profileId]: '' }))
+    try {
+      await onPermission(profileId, mode)
+    } catch (cause) {
+      setPermissionDrafts(current => { const next = { ...current }; delete next[profileId]; return next })
+      setPermissionErrors(current => ({ ...current, [profileId]: cause instanceof Error ? cause.message : String(cause) }))
+    } finally {
+      setPermissionBusy(current => ({ ...current, [profileId]: false }))
+    }
+  }
+
   const activeCount = roles.filter(role => ACTIVE_ROLE_ACTIVITY.has(role.status)).length
   const errorCount = roles.filter(role => role.status === 'error').length
 
@@ -1165,18 +1212,22 @@ function RoleMonitor(props: { monitor?: ActivityMonitor }): ReactNode {
           const isOpen = expanded[role.profileId] ?? false
           return (
             <article className="arena-role-activity" data-status={role.status} key={role.profileId}>
-              <button className="arena-role-activity__toggle" type="button" aria-expanded={isOpen} onClick={() => setExpanded(current => ({ ...current, [role.profileId]: !isOpen }))}>
-                <Avatar value={role.avatar} name={role.name} />
-                <span><strong>{role.name}</strong><small>{role.stage || ROLE_ACTIVITY_TEXT[role.status] || role.status}</small></span>
-                <i className="arena-role-activity__status"><b />{ROLE_ACTIVITY_TEXT[role.status] || role.status}</i>
-                <em>{isOpen ? '−' : '+'}</em>
-              </button>
+              <div className="arena-role-activity__row">
+                <button className="arena-role-activity__toggle" type="button" aria-expanded={isOpen} onClick={() => setExpanded(current => ({ ...current, [role.profileId]: !isOpen }))}>
+                  <Avatar value={role.avatar} name={role.name} />
+                  <span><strong>{role.name}</strong><small>{role.stage || ROLE_ACTIVITY_TEXT[role.status] || role.status}</small></span>
+                  <i className="arena-role-activity__status"><b />{ROLE_ACTIVITY_TEXT[role.status] || role.status}</i>
+                  <em>{isOpen ? '−' : '+'}</em>
+                </button>
+                {onPermission ? <div className="arena-role-activity__permission-wrap"><select className="arena-role-activity__permission" aria-label={`${role.name} 的 Agent 权限`} disabled={permissionBusy[role.profileId] === true} value={permissionDrafts[role.profileId] ?? permissions?.[role.profileId] ?? 'danger-full-access'} onChange={event => void changePermission(role.profileId, event.target.value)}><option value="read-only">Read Only</option><option value="workspace-write">Workspace Write</option><option value="danger-full-access">Full access</option></select>{permissionBusy[role.profileId] ? <small>保存中…</small> : permissionErrors[role.profileId] ? <small className="is-error" title={permissionErrors[role.profileId]}>设置失败</small> : null}</div> : null}
+              </div>
               {isOpen ? (
                 <div className="arena-role-activity__body">
                   {role.detail ? <p>{role.detail}</p> : <p className="is-muted">暂无更多细节。</p>}
                   {role.currentTool ? <div className="arena-role-tool"><span>当前工具</span><code>{role.currentTool}</code></div> : null}
                   {role.claimedFiles.length ? <div className="arena-role-files"><span>已锁定文件</span>{role.claimedFiles.map(file => <code key={file} title={file}>🔒 {compactFilePath(file)}</code>)}</div> : null}
                   {role.recent.length ? <div className="arena-role-events"><span>最近动作</span>{[...role.recent].reverse().slice(0, 6).map(event => <div data-kind={event.kind} key={event.id}><i /><p>{event.text}</p><time>{activityTime(event.createdAt)}</time></div>)}</div> : null}
+                  <button className="arena-role-history-button" type="button" onClick={() => setHistoryRole(role)}>查看动作记录{role.history?.length ? `（${role.history.length}）` : ''}</button>
                   <div className="arena-role-updated">最后更新 {activityTime(role.updatedAt)}</div>
                 </div>
               ) : null}
@@ -1186,8 +1237,33 @@ function RoleMonitor(props: { monitor?: ActivityMonitor }): ReactNode {
         {!roles.length ? <div className="arena-role-monitor__empty">尚无角色运行数据。</div> : null}
       </div>
       <div className="arena-role-monitor__note">文件编辑采用角色锁；冲突文件会在工具执行前被阻止。</div>
+      {historyRole ? <div className="arena-dialog-backdrop" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) setHistoryRole(null) }}>
+        <section className="arena-dialog arena-role-history-dialog" role="dialog" aria-modal="true" aria-label={`${historyRole.name} 的动作记录`}>
+          <header><div><strong>{historyRole.name} · 动作记录</strong><span>完整保留，不再用新动作覆盖旧记录</span></div><button type="button" onClick={() => setHistoryRole(null)}>×</button></header>
+          <div className="arena-role-history-list">{[...(historyRole.history ?? historyRole.recent)].reverse().map(event => <div data-kind={event.kind} key={event.id}><i /><p>{event.text}</p><time>{activityTime(event.createdAt)}</time></div>)}{!(historyRole.history ?? historyRole.recent).length ? <p className="is-muted">暂无动作记录。</p> : null}</div>
+        </section>
+      </div> : null}
     </section>
   )
+}
+
+function ApprovalCard(props: { approval?: ApprovalRequest; onResolve: (outcome: 'allowed-once' | 'rejected', note?: string) => Promise<void> }): ReactNode {
+  const { approval, onResolve } = props
+  const [note, setNote] = useState('')
+  const [busy, setBusy] = useState(false)
+  if (!approval) return null
+  const pending = approval.status === 'pending'
+  const resolve = async (outcome: 'allowed-once' | 'rejected', withNote = false): Promise<void> => {
+    setBusy(true)
+    try { await onResolve(outcome, withNote ? note.trim() : undefined) } finally { setBusy(false) }
+  }
+  return <div className="arena-approval-card" data-status={approval.status}>
+    <div className="arena-approval-card__title">🛡️ 权限审计 {pending ? '· 等待你的决定' : `· ${approval.status === 'approved' ? '已允许一次' : approval.status === 'rejected' ? '已拒绝' : '已取消'}`}</div>
+    {pending ? <>
+      <div className="arena-approval-card__actions"><button type="button" disabled={busy} onClick={() => void resolve('allowed-once')}>允许一次</button><button type="button" disabled={busy} onClick={() => void resolve('rejected')}>拒绝</button></div>
+      <div className="arena-approval-card__manual"><input className="arena-input" value={note} maxLength={2000} placeholder="也可以输入备注或执行要求" onChange={event => setNote(event.target.value)} /><button type="button" disabled={busy || !note.trim()} onClick={() => void resolve('allowed-once', true)}>允许并附加说明</button></div>
+    </> : approval.note ? <p>{approval.note}</p> : null}
+  </div>
 }
 
 function ChatView(props: {
@@ -1198,8 +1274,10 @@ function ChatView(props: {
   onRename: (name: string) => Promise<void>
   onInvite: (profileIds: string[]) => Promise<void>
   onDelete: () => Promise<void>
+  onApproval: (approvalId: string, outcome: 'allowed-once' | 'rejected', note?: string) => Promise<void>
+  onPermission: (profileId: string, mode: string) => Promise<void>
 }): ReactNode {
-  const { room, profiles, onSend, onRetry, onRename, onInvite, onDelete } = props
+  const { room, profiles, onSend, onRetry, onRename, onInvite, onDelete, onApproval, onPermission } = props
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -1208,7 +1286,9 @@ function ChatView(props: {
   const [inviteIds, setInviteIds] = useState<string[]>([])
   const [settingsBusy, setSettingsBusy] = useState(false)
   const [settingsError, setSettingsError] = useState('')
+  const [monitorWidth, setMonitorWidth] = useState(310)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const chatLayoutRef = useRef<HTMLDivElement>(null)
   const respondingIds = room.respondingProfileIds?.length ? room.respondingProfileIds : room.respondingProfileId ? [room.respondingProfileId] : []
   const responding = room.participants.filter(item => respondingIds.includes(item.id))
   const respondingNames = responding.map(item => item.name).join('、')
@@ -1269,8 +1349,20 @@ function ChatView(props: {
     } finally { setSettingsBusy(false) }
   }
 
+  const resizeMonitor = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    const layout = chatLayoutRef.current
+    if (!layout) return
+    event.preventDefault()
+    const bounds = layout.getBoundingClientRect()
+    const move = (pointer: PointerEvent): void => setMonitorWidth(Math.round(Math.min(560, Math.max(240, bounds.right - pointer.clientX))))
+    const stop = (): void => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', stop); document.body.classList.remove('arena-is-resizing') }
+    document.body.classList.add('arena-is-resizing')
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', stop, { once: true })
+  }
+
   return (
-    <div className="arena-chat-layout">
+    <div className="arena-chat-layout" ref={chatLayoutRef} style={{ '--arena-chat-monitor-width': `${monitorWidth}px` } as CSSProperties}>
     <div className="arena-chat">
       <header className="arena-chat-head">
         <div className="arena-chat-stack">
@@ -1285,6 +1377,7 @@ function ChatView(props: {
           <div className="arena-chat-settings__head"><div><strong>{room.type === 'group' ? '群设置' : '聊天设置'}</strong><span>修改名称{room.type === 'group' ? '并邀请新的 AI 用户' : ''}</span></div><button type="button" aria-label="关闭设置" onClick={() => setSettingsOpen(false)}>×</button></div>
           <label className="arena-field"><span>{room.type === 'group' ? '群聊名称' : '聊天名称'}</span><div className="arena-settings-name"><input className="arena-input" value={roomName} maxLength={80} onChange={event => setRoomName(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') void saveRoomName() }} /><button className="arena-control arena-control--primary" type="button" disabled={settingsBusy || roomName.trim() === room.name} onClick={() => void saveRoomName()}>保存名称</button></div></label>
           {room.type === 'group' ? <section><div className="arena-chat-settings__section"><strong>邀请 AI 用户</strong><span>当前 {room.participants.length}/12 位 AI</span></div>{availableInvitees.length ? <div className="arena-invite-list">{availableInvitees.map(profile => <button type="button" key={profile.id} className={inviteIds.includes(profile.id) ? 'is-active' : ''} onClick={() => setInviteIds(current => current.includes(profile.id) ? current.filter(id => id !== profile.id) : room.participants.length + current.length < 12 ? [...current, profile.id] : current)}><Avatar value={profile.avatar} name={profile.name} /><span><strong>{profile.name}</strong><small>{profile.provider}/{profile.model}</small></span><i>{inviteIds.includes(profile.id) ? '✓' : '+'}</i></button>)}</div> : <div className="arena-invite-empty">AI 用户库中没有可邀请的新成员。</div>}<button className="arena-launch arena-invite-submit" type="button" disabled={settingsBusy || !inviteIds.length} onClick={() => void inviteMembers()}>{settingsBusy ? '处理中…' : `邀请选中的 ${inviteIds.length || ''} 位成员`}</button></section> : null}
+          <section className="arena-permission-section"><div className="arena-chat-settings__section"><strong>本聊天的 Agent 权限</strong><span>每个对话单独生效；默认 Full access</span></div>{room.participants.map(profile => <label className="arena-permission-row" key={profile.id}><Avatar value={profile.avatar} name={profile.name} /><span>{profile.name}</span><select value={room.permissions?.[profile.id] || 'danger-full-access'} onChange={event => void onPermission(profile.id, event.target.value)}><option value="read-only">Read Only</option><option value="workspace-write">Workspace Write</option><option value="danger-full-access">Full access</option></select></label>)}</section>
           {settingsError ? <div className="arena-error">{settingsError}</div> : null}
         </aside>
       ) : null}
@@ -1297,7 +1390,7 @@ function ChatView(props: {
           </div>
         ) : null}
         {room.messages.map(message => message.kind === 'system' ? (
-          <div className="arena-chat-system" key={message.id}>{message.text}</div>
+          <div className="arena-chat-system" key={message.id}>{message.text}{message.approval ? <ApprovalCard approval={message.approval} onResolve={(outcome, note) => onApproval(message.approval!.id, outcome, note)} /> : null}</div>
         ) : (
           <div className="arena-message-row" data-kind={message.kind === 'human' ? 'user' : message.kind === 'admin' ? 'admin' : 'participant'} key={message.id}>
             <Avatar value={message.avatar} name={message.senderName} className="arena-avatar--message" />
@@ -1319,6 +1412,7 @@ function ChatView(props: {
         <div><textarea className="arena-textarea" value={text} maxLength={4000} placeholder={room.status === 'responding' ? `${respondingNames || 'AI'} 正在并行处理，你仍可继续发言或 @其他成员…` : '发送消息；不 @ 时所有未静默的 AI 会同时回应；也可说“某某别说话”'} onChange={event => setText(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void send() } }} /><button className="arena-send" type="button" disabled={busy || !text.trim()} onClick={() => void send()}>发送</button></div>
       </footer>
     </div>
+    <div className="arena-chat-resizer" role="separator" aria-label="调整右侧状态栏宽度" aria-orientation="vertical" aria-valuemin={240} aria-valuemax={560} aria-valuenow={monitorWidth} tabIndex={0} onPointerDown={resizeMonitor} onKeyDown={event => { if (event.key === 'ArrowLeft') setMonitorWidth(width => Math.min(560, width + 20)); else if (event.key === 'ArrowRight') setMonitorWidth(width => Math.max(240, width - 20)) }} />
     <aside className="arena-chat-side"><RoleMonitor monitor={room.activityMonitor} /></aside>
     </div>
   )
@@ -1434,8 +1528,9 @@ function CollaborationConsole(props: {
   active: boolean
   onAction: (body: object) => Promise<boolean>
   onCompose: (text: string) => void
+  onPermission: (profileId: string, mode: string) => Promise<void>
 }): ReactNode {
-  const { meeting, busy, active, onAction, onCompose } = props
+  const { meeting, busy, active, onAction, onCompose, onPermission } = props
   const [tab, setTab] = useState<WorkspaceTab>('activity')
   const [taskFormOpen, setTaskFormOpen] = useState(false)
   const [taskTitle, setTaskTitle] = useState('')
@@ -1450,16 +1545,27 @@ function CollaborationConsole(props: {
   const [artifactDescription, setArtifactDescription] = useState('')
   const [artifactLocation, setArtifactLocation] = useState('')
   const [artifactType, setArtifactType] = useState<MeetingArtifact['artifactType']>('note')
+  const [sectionHeights, setSectionHeights] = useState<Record<Exclude<WorkspaceTab, 'activity'>, number>>({ tasks: 420, decisions: 520, artifacts: 420 })
   const tasks = meeting.tasks ?? []
   const decisions = meeting.decisions ?? []
   const artifacts = meeting.artifacts ?? []
   const stage = meeting.collaborationStage ?? (meeting.status === 'completed' ? 'completed' : 'discussion')
   const administrator = meeting.administratorProfile ?? { id: 'administrator', name: '管理员', avatar: '🛡️' }
-  const human = meeting.humanProfile ?? { id: 'human', name: '你', avatar: '🧑' }
-  const mutedIds = new Set(meeting.mutedParticipantIds ?? [])
   const owners = [{ id: 'administrator', name: administrator.name }, ...meeting.participants.map(item => ({ id: item.id || '', name: item.name }))]
   const ownerName = (id: string | null): string => owners.find(item => item.id === id)?.name || '未分配'
   const blockers = tasks.filter(item => item.status === 'blocked')
+
+  const resizeSection = (event: ReactPointerEvent<HTMLDivElement>, key: Exclude<WorkspaceTab, 'activity'>): void => {
+    event.preventDefault()
+    const startY = event.clientY
+    const startHeight = sectionHeights[key]
+    const move = (pointer: PointerEvent): void => setSectionHeights(current => ({ ...current, [key]: Math.round(Math.min(1000, Math.max(220, startHeight + pointer.clientY - startY))) }))
+    const stop = (): void => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', stop); document.body.classList.remove('arena-is-row-resizing') }
+    event.currentTarget.setPointerCapture?.(event.pointerId)
+    document.body.classList.add('arena-is-row-resizing')
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', stop, { once: true })
+  }
 
   const createTask = async (): Promise<void> => {
     if (!taskTitle.trim()) return
@@ -1500,17 +1606,9 @@ function CollaborationConsole(props: {
       </div>
 
       <div className="arena-workspace-scroll">
-        {tab === 'activity' ? <>
-          <RoleMonitor monitor={meeting.activityMonitor} />
-          <section className="arena-workspace-members">
-            <h3>会议成员</h3>
-            <div className="arena-member"><Avatar value={human.avatar} name={human.name} /><span><strong>{human.name}</strong><small>人类用户 · 最终决策者</small></span></div>
-            <div className="arena-member"><Avatar value={administrator.avatar} name={administrator.name} /><span><strong>{administrator.name}</strong><small>{administrator.model || '会议管理员'}</small></span></div>
-            {meeting.participants.map(participant => <div className="arena-member" data-muted={mutedIds.has(participant.id)} key={participant.id}><Avatar value={participant.avatar} name={participant.name} /><span><strong>{participant.name}</strong><small>{mutedIds.has(participant.id) ? '已静默' : participant.status === 'working' || participant.status === 'thinking' ? '正在工作…' : participant.model}</small></span></div>)}
-          </section>
-        </> : null}
+        {tab === 'activity' ? <RoleMonitor monitor={meeting.activityMonitor} permissions={meeting.permissions} onPermission={onPermission} /> : null}
 
-        {tab === 'tasks' ? <section className="arena-workspace-section">
+        {tab === 'tasks' ? <><section className="arena-workspace-section" style={{ height: `${sectionHeights.tasks}px` }}>
           <div className="arena-workspace-section__head"><span><h3>任务板</h3><p>{blockers.length ? `${blockers.length} 项受阻，需要处理` : '分配负责人并跟踪交付状态'}</p></span><button type="button" onClick={() => setTaskFormOpen(value => !value)}>＋ 新建</button></div>
           {taskFormOpen ? <div className="arena-workspace-form">
             <input className="arena-input" value={taskTitle} maxLength={160} placeholder="任务标题" onChange={event => setTaskTitle(event.target.value)} />
@@ -1534,9 +1632,9 @@ function CollaborationConsole(props: {
             </div>
           </article>)}</div>
           {!tasks.length ? <div className="arena-workspace-empty">还没有任务。人类或 AI 都可以把工作拆到这里。</div> : null}
-        </section> : null}
+        </section><div className="arena-workspace-section-resizer" role="separator" aria-label="调整任务板高度" aria-orientation="horizontal" aria-valuemin={220} aria-valuemax={1000} aria-valuenow={sectionHeights.tasks} tabIndex={0} onPointerDown={event => resizeSection(event, 'tasks')} onKeyDown={event => { if (event.key === 'ArrowUp') setSectionHeights(current => ({ ...current, tasks: Math.max(220, current.tasks - 20) })); else if (event.key === 'ArrowDown') setSectionHeights(current => ({ ...current, tasks: Math.min(1000, current.tasks + 20) })) }} /> </> : null}
 
-        {tab === 'decisions' ? <section className="arena-workspace-section">
+        {tab === 'decisions' ? <><section className="arena-workspace-section" style={{ height: `${sectionHeights.decisions}px` }}>
           <div className="arena-workspace-section__head"><span><h3>决策板</h3><p>比较方案与风险，由你做最终选择</p></span><button type="button" onClick={() => setDecisionFormOpen(value => !value)}>＋ 新建</button></div>
           {decisionFormOpen ? <div className="arena-workspace-form">
             <input className="arena-input" value={decisionTitle} maxLength={160} placeholder="要决定什么？" onChange={event => setDecisionTitle(event.target.value)} />
@@ -1557,9 +1655,9 @@ function CollaborationConsole(props: {
             <div className="arena-card-actions"><button type="button" disabled={!active || busy} onClick={() => void onAction({ action: 'request-evidence', subject: `决策“${decision.title}”` })}>要求证据</button><button className="is-danger" type="button" disabled={busy} onClick={() => { if (window.confirm(`删除决策“${decision.title}”？`)) void onAction({ action: 'decision-delete', decisionId: decision.id }) }}>删除</button></div>
           </article>)}</div>
           {!decisions.length ? <div className="arena-workspace-empty">出现多个可行方案时，把它们放到这里比较理由、风险与可行性。</div> : null}
-        </section> : null}
+        </section><div className="arena-workspace-section-resizer" role="separator" aria-label="调整决策板高度" aria-orientation="horizontal" aria-valuemin={220} aria-valuemax={1000} aria-valuenow={sectionHeights.decisions} tabIndex={0} onPointerDown={event => resizeSection(event, 'decisions')} onKeyDown={event => { if (event.key === 'ArrowUp') setSectionHeights(current => ({ ...current, decisions: Math.max(220, current.decisions - 20) })); else if (event.key === 'ArrowDown') setSectionHeights(current => ({ ...current, decisions: Math.min(1000, current.decisions + 20) })) }} /> </> : null}
 
-        {tab === 'artifacts' ? <section className="arena-workspace-section">
+        {tab === 'artifacts' ? <><section className="arena-workspace-section" style={{ height: `${sectionHeights.artifacts}px` }}>
           <div className="arena-workspace-section__head"><span><h3>成果库</h3><p>文件、链接、结论与阶段总结</p></span><button type="button" onClick={() => setArtifactFormOpen(value => !value)}>＋ 添加</button></div>
           {artifactFormOpen ? <div className="arena-workspace-form">
             <input className="arena-input" value={artifactTitle} maxLength={160} placeholder="成果标题" onChange={event => setArtifactTitle(event.target.value)} />
@@ -1574,7 +1672,7 @@ function CollaborationConsole(props: {
             <div className="arena-card-actions"><button type="button" disabled={busy || artifact.status === 'accepted'} onClick={() => void onAction({ action: 'artifact-update', artifactId: artifact.id, status: 'accepted' })}>验收</button><button type="button" disabled={busy || artifact.status === 'rejected'} onClick={() => void onAction({ action: 'artifact-update', artifactId: artifact.id, status: 'rejected' })}>驳回结果</button><button type="button" disabled={!active || busy} onClick={() => void onAction({ action: 'request-evidence', subject: `成果“${artifact.title}”` })}>要求证据</button><button className="is-danger" type="button" disabled={busy} onClick={() => { if (window.confirm(`删除成果“${artifact.title}”？`)) void onAction({ action: 'artifact-delete', artifactId: artifact.id }) }}>删除</button></div>
           </article>)}</div>
           {!artifacts.length ? <div className="arena-workspace-empty">AI 完成文件、调研、链接或结论后，会沉淀在这里等待你验收。</div> : null}
-        </section> : null}
+        </section><div className="arena-workspace-section-resizer" role="separator" aria-label="调整成果库高度" aria-orientation="horizontal" aria-valuemin={220} aria-valuemax={1000} aria-valuenow={sectionHeights.artifacts} tabIndex={0} onPointerDown={event => resizeSection(event, 'artifacts')} onKeyDown={event => { if (event.key === 'ArrowUp') setSectionHeights(current => ({ ...current, artifacts: Math.max(220, current.artifacts - 20) })); else if (event.key === 'ArrowDown') setSectionHeights(current => ({ ...current, artifacts: Math.min(1000, current.artifacts + 20) })) }} /> </> : null}
       </div>
 
       <div className="arena-workspace-quick">
@@ -1585,16 +1683,18 @@ function CollaborationConsole(props: {
   )
 }
 
-function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; onAction: (body: object) => Promise<void> }): ReactNode {
-  const { meeting, profiles, onAction } = props
+function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; onAction: (body: object) => Promise<void>; onApproval: (approvalId: string, outcome: 'allowed-once' | 'rejected', note?: string) => Promise<void> }): ReactNode {
+  const { meeting, profiles, onAction, onApproval } = props
   const [message, setMessage] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [inviteOpen, setInviteOpen] = useState(false)
   const [inviteIds, setInviteIds] = useState<string[]>([])
   const [workspaceWidth, setWorkspaceWidth] = useState(370)
+  const [headerHeight, setHeaderHeight] = useState(82)
   const stageRef = useRef<HTMLDivElement>(null)
   const collabRef = useRef<HTMLDivElement>(null)
+  const watchRef = useRef<HTMLDivElement>(null)
   const active = true
   const busyMeeting = BUSY_MEETINGS.has(meeting.status)
   const administrator = meeting.administratorProfile ?? { id: 'administrator', name: '管理员', avatar: '🛡️' }
@@ -1648,6 +1748,19 @@ function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; 
     window.addEventListener('pointerup', stop, { once: true })
   }
 
+  const resizeHeader = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    const layout = watchRef.current
+    if (!layout) return
+    event.preventDefault()
+    event.currentTarget.setPointerCapture?.(event.pointerId)
+    const bounds = layout.getBoundingClientRect()
+    const move = (pointer: PointerEvent): void => setHeaderHeight(Math.round(Math.min(240, Math.max(64, pointer.clientY - bounds.top))))
+    const stop = (): void => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', stop); document.body.classList.remove('arena-is-row-resizing') }
+    document.body.classList.add('arena-is-row-resizing')
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', stop, { once: true })
+  }
+
   const inviteMembers = async (): Promise<void> => {
     if (!inviteIds.length) { setError('请至少选择一位要邀请的 AI 用户。'); return }
     if (await act({ action: 'invite-members', profileIds: inviteIds })) {
@@ -1656,8 +1769,15 @@ function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; 
     }
   }
 
+  const setMeetingPermission = async (profileId: string, mode: string): Promise<void> => {
+    await onAction({ action: 'set-permission', profileId, mode })
+  }
+
+  const headerTitleSize = Math.round(Math.min(29, Math.max(13, 13 + (headerHeight - 64) * 0.09)))
+  const headerMetaSize = Math.round(Math.min(13, Math.max(9, 9 + (headerHeight - 64) * 0.025)))
+
   return (
-    <div className="arena-watch">
+    <div className="arena-watch" ref={watchRef} style={{ '--arena-watch-head-height': `${headerHeight}px`, '--arena-watch-title-size': `${headerTitleSize}px`, '--arena-watch-meta-size': `${headerMetaSize}px` } as CSSProperties}>
       <div className="arena-watch-head">
         <div className="arena-watch-head__title">
           <h2 title={meeting.topic}>{meetingTitle(meeting)}</h2>
@@ -1670,6 +1790,7 @@ function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; 
           <button className="arena-control" type="button" onClick={() => { setInviteOpen(value => !value); setError('') }}>{inviteOpen ? '关闭邀请' : '＋ 邀请成员'}</button>
           <span className="arena-status" data-status={meeting.status}>{STATUS_TEXT[meeting.status] ?? meeting.status}</span>
         </div>
+        <div className="arena-watch-head-resizer" role="separator" aria-label="调整会议顶部区域高度" aria-orientation="horizontal" aria-valuemin={64} aria-valuemax={240} aria-valuenow={headerHeight} tabIndex={0} onPointerDown={resizeHeader} onKeyDown={event => { if (event.key === 'ArrowUp') { event.preventDefault(); setHeaderHeight(height => Math.max(64, height - 10)) } else if (event.key === 'ArrowDown') { event.preventDefault(); setHeaderHeight(height => Math.min(240, height + 10)) } }} />
       </div>
 
       {inviteOpen ? (
@@ -1687,7 +1808,7 @@ function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; 
               {meeting.transcript.map(item => {
                 if (item.kind === 'system') return /^第\s*\d+\s*轮/.test(item.text)
                   ? null
-                  : <div className="arena-round-label" key={item.id}>{item.text}</div>
+                  : <div className="arena-round-label" key={item.id}>{item.text}{item.approval ? <ApprovalCard approval={item.approval} onResolve={(outcome, note) => onApproval(item.approval!.id, outcome, note)} /> : null}</div>
                 const participant = meeting.participants.find(entry => entry.id === item.speakerId)
                 const avatar = item.avatar || participant?.avatar || (item.kind === 'user' ? human.avatar : item.kind === 'admin' ? administrator.avatar : '🤖')
                 return (
@@ -1723,7 +1844,7 @@ function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; 
             else if (event.key === 'ArrowRight') setWorkspaceWidth(width => Math.max(280, width - 20))
           }}
         />
-        <CollaborationConsole meeting={meeting} busy={busy} active={active} onAction={act} onCompose={setMessage} />
+        <CollaborationConsole meeting={meeting} busy={busy} active={active} onAction={act} onCompose={setMessage} onPermission={setMeetingPermission} />
       </div>
 
       <div className="arena-controls">
@@ -1809,6 +1930,18 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
       method: 'POST', body: JSON.stringify(body),
     })
     setState(current => ({ ...current, meetings: current.meetings.map(item => item.id === result.meeting.id ? result.meeting : item) }))
+  }
+
+  const resolveApproval = async (approvalId: string, outcome: 'allowed-once' | 'rejected', note?: string): Promise<void> => {
+    if (selected) {
+      const result = await jsonRequest<{ meeting: Meeting }>(`/meetings/${encodeURIComponent(selected.id)}/actions`, { method: 'POST', body: JSON.stringify({ action: 'approval', approvalId, outcome, note }) })
+      setState(current => ({ ...current, meetings: current.meetings.map(item => item.id === result.meeting.id ? result.meeting : item) }))
+      return
+    }
+    if (selectedRoom) {
+      const result = await jsonRequest<{ room: ChatRoom }>(`/rooms/${encodeURIComponent(selectedRoom.id)}/actions`, { method: 'POST', body: JSON.stringify({ action: 'approval', approvalId, outcome, note }) })
+      setState(current => ({ ...current, rooms: (current.rooms ?? []).map(item => item.id === result.room.id ? result.room : item) }))
+    }
   }
 
   const created = (meeting: Meeting): void => {
@@ -1905,6 +2038,12 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
     if (!selectedRoom) return
     const result = await jsonRequest<{ room: ChatRoom }>(`/rooms/${encodeURIComponent(selectedRoom.id)}/members`, { method: 'POST', body: JSON.stringify({ profileIds }) })
     setState(current => ({ ...current, rooms: (current.rooms ?? []).map(room => room.id === result.room.id ? result.room : room) }))
+  }
+
+  const setRoomPermission = async (profileId: string, mode: string): Promise<void> => {
+    if (!selectedRoom) return
+    const result = await jsonRequest<{ room: ChatRoom }>(`/rooms/${encodeURIComponent(selectedRoom.id)}/actions`, { method: 'POST', body: JSON.stringify({ action: 'set-permission', profileId, mode }) })
+    setState(current => ({ ...current, rooms: (current.rooms ?? []).map(item => item.id === result.room.id ? result.room : item) }))
   }
 
   const deleteRoom = async (): Promise<void> => {
@@ -2030,7 +2169,7 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
                  ) : view === 'create-chat' ? (
                   <CreateChatView profiles={state.profiles} initialType={chatType} onManageProfiles={() => setView('profiles')} onCreated={roomCreated} />
                 ) : view === 'chat' && selectedRoom ? (
-                  <ChatView room={selectedRoom} profiles={state.profiles} onSend={sendRoomMessage} onRetry={retrySelectedRoom} onRename={renameSelectedRoom} onInvite={inviteRoomMembers} onDelete={deleteRoom} />
+                  <ChatView room={selectedRoom} profiles={state.profiles} onSend={sendRoomMessage} onRetry={retrySelectedRoom} onRename={renameSelectedRoom} onInvite={inviteRoomMembers} onDelete={deleteRoom} onApproval={resolveApproval} onPermission={setRoomPermission} />
                 ) : view === 'setup' || !selected ? (
                   <SetupView
                     templates={state.templates.length ? state.templates : FALLBACK_TEMPLATES}
@@ -2039,7 +2178,7 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
                     onCreated={created}
                   />
                 ) : (
-                  <WatchView meeting={selected} profiles={state.profiles} onAction={runAction} />
+                  <WatchView meeting={selected} profiles={state.profiles} onAction={runAction} onApproval={resolveApproval} />
                 )}
               </main>
             </div>
