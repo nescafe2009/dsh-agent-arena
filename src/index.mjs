@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import {
   API_ROOT,
@@ -156,6 +156,19 @@ async function readJsonBody(req) {
 function respond(res, status, body) {
   res.writeHead(status, JSON_HEADERS)
   res.end(JSON.stringify(body))
+}
+
+// Same-origin fence: browsers always send an Origin header on cross-site
+// requests. Non-browser clients (curl, scripts) send none and are allowed.
+// An Origin that does not match the request's Host means another page is
+// trying to drive this loopback API — reject it before any handler runs.
+function assertSameOrigin(req) {
+  const origin = req.headers?.origin
+  if (!origin) return
+  let originHost = ''
+  try { originHost = new URL(origin).host } catch { throw new HttpError(403, '请求来源不合法') }
+  const host = String(req.headers?.host || '')
+  if (!host || originHost !== host) throw new HttpError(403, '请求来源不合法')
 }
 
 function transcriptText(items, emptyText = '（还没有消息）') {
@@ -863,7 +876,12 @@ export function apply(ctx, config = {}) {
     const payload = JSON.stringify({ version: 4, meetings: [...meetings.values()], rooms: [...rooms.values()], profiles, migrations }, null, 2)
     persistChain = persistChain.catch(() => undefined).then(async () => {
       await mkdir(stateDir, { recursive: true })
-      await writeFile(stateFile, `${payload}\n`, 'utf8')
+      // Atomic write: never leave a truncated state file behind if the process
+      // crashes mid-write. Write to a unique temp file, fsync-equivalent via
+      // rename (POSIX atomic), so readers only ever see old or new content.
+      const tempFile = `${stateFile}.tmp-${process.pid}-${Date.now()}`
+      await writeFile(tempFile, `${payload}\n`, 'utf8')
+      await rename(tempFile, stateFile)
     })
     return persistChain
   }
@@ -2542,6 +2560,7 @@ export function apply(ctx, config = {}) {
     handler: async (req, res) => {
       try {
         await hydrated
+        assertSameOrigin(req)
         const url = new URL(req.url ?? '/', 'http://dsh.internal')
         const method = String(req.method ?? 'GET').toUpperCase()
         const suffix = url.pathname.slice(API_ROOT.length) || '/'
